@@ -58,6 +58,9 @@ port_busy() { ss -ltnH "sport = :$1" 2>/dev/null | grep -q .; }
 
 # ── 1. Пакеты ────────────────────────────────────────────────────────────────
 export DEBIAN_FRONTEND=noninteractive
+# apt и Playwright — только с </dev/null: timeout уводит команду в свою группу
+# процессов, и apt, тронув терминал, получает SIGTTOU и замирает (статус T в
+# ps) — установка «висела» на пакетах, уже поставив их.
 APT=(-o DPkg::Lock::Timeout=600 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
 # dpkg занят (на свежем VPS — unattended-upgrades): говорим, кого ждём, а
 # не молчим — иначе ожидание неотличимо от зависания.
@@ -80,15 +83,15 @@ for p in fonts-dejavu-core fonts-noto-color-emoji; do
 done
 if [ ${#NEED[@]} -gt 0 ] || [ ${#FONTS[@]} -gt 0 ]; then
     log "Пакеты: ${NEED[*]} ${FONTS[*]} (apt-get update, до 5 минут)"
-    timeout 300 apt-get "${APT[@]}" update -qq 2>&1 | tail -3 || warn "apt-get update не прошёл — пробуем с тем, что есть"
+    timeout 300 apt-get "${APT[@]}" update -qq </dev/null 2>&1 | tail -3 || warn "apt-get update не прошёл — пробуем с тем, что есть"
     if [ ${#NEED[@]} -gt 0 ]; then
-        timeout 900 apt-get "${APT[@]}" install -y --no-install-recommends "${NEED[@]}" 2>&1 \
+        timeout 900 apt-get "${APT[@]}" install -y --no-install-recommends "${NEED[@]}" </dev/null 2>&1 \
             | { grep -E --line-buffered '^(Get:|Setting up|E:)' || true; } \
             || die "apt-get install не прошёл (или занят dpkg: ps aux | grep -E 'apt|dpkg')"
         for p in "${NEED[@]}"; do dpkg -s "$p" >/dev/null 2>&1 || die "пакет $p не встал — вывод apt выше"; done
     fi
     if [ ${#FONTS[@]} -gt 0 ]; then
-        timeout 600 apt-get "${APT[@]}" install -y --no-install-recommends "${FONTS[@]}" 2>&1 \
+        timeout 600 apt-get "${APT[@]}" install -y --no-install-recommends "${FONTS[@]}" </dev/null 2>&1 \
             | { grep -E --line-buffered '^(Get:|E:)' || true; } \
             || warn "шрифты не встали — на скриншотах могут быть квадраты вместо эмодзи"
     fi
@@ -120,7 +123,7 @@ chmod -R a+rX "$APP"
 log "venv и зависимости"
 if [ ! -x "$BASE/venv/bin/pip" ]; then
     PYV="$(python3 -c 'import sys; print("%d.%d" % sys.version_info[:2])')"
-    timeout 600 apt-get "${APT[@]}" install -y -qq "python${PYV}-venv" >/dev/null 2>&1 || true
+    timeout 600 apt-get "${APT[@]}" install -y -qq "python${PYV}-venv" </dev/null >/dev/null 2>&1 || true
     rm -rf "$BASE/venv"
     python3 -m venv "$BASE/venv" || die "python3 -m venv не прошёл — apt-get install python${PYV}-venv"
 fi
@@ -137,7 +140,7 @@ BROWSER_ON=0
 if [ "$WITH_BROWSER" = "1" ]; then
     log "Chromium и его библиотеки (Playwright, ~200 МБ; несколько минут)"
     if PLAYWRIGHT_BROWSERS_PATH="$BASE/pw-browsers" timeout 1500 "$BASE/venv/bin/python" -m playwright \
-            install --with-deps chromium 2>&1 \
+            install --with-deps chromium </dev/null 2>&1 \
             | { grep -E --line-buffered -i '^(Downloading|Chromium|Installing|Get:|Setting up|E:|Error|Failed)' || true; }; then
         chmod -R a+rX "$BASE/pw-browsers" 2>/dev/null || true
         BROWSER_ON=1
