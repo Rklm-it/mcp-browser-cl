@@ -57,14 +57,44 @@ envget() { grep -E "^$1=" "$2" 2>/dev/null | tail -1 | cut -d= -f2- || true; }
 port_busy() { ss -ltnH "sport = :$1" 2>/dev/null | grep -q .; }
 
 # ── 1. Пакеты ────────────────────────────────────────────────────────────────
-log "Пакеты: git, python3-venv, curl, шрифты"
 export DEBIAN_FRONTEND=noninteractive
-APT=(-o DPkg::Lock::Timeout=180 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
-timeout 300 apt-get "${APT[@]}" update -qq >/dev/null 2>&1 || warn "apt-get update не прошёл — пробуем с тем, что есть"
-# Шрифты: без них кириллица и эмодзи на скриншотах — квадраты.
-timeout 900 apt-get "${APT[@]}" install -y -qq git python3 python3-venv curl ca-certificates \
-    fonts-dejavu-core fonts-noto-color-emoji >/dev/null \
-    || die "apt-get install не прошёл (или занят dpkg: ps aux | grep -E 'apt|dpkg')"
+APT=(-o DPkg::Lock::Timeout=600 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
+# dpkg занят (на свежем VPS — unattended-upgrades): говорим, кого ждём, а
+# не молчим — иначе ожидание неотличимо от зависания.
+dpkg_busy() { pgrep -a -x 'apt|apt-get|dpkg|unattended-upgr' 2>/dev/null | grep -v "^$$ " | head -1; }
+waited=0
+while b="$(dpkg_busy)" && [ -n "$b" ] && [ "$waited" -lt 900 ]; do
+    [ "$waited" = "0" ] && warn "dpkg занят: ${b#* } — жду (обычно это автообновления, до 15 минут; ускорить: systemctl stop unattended-upgrades)"
+    sleep 10; waited=$((waited + 10))
+    [ $((waited % 60)) = 0 ] && echo "    …жду dpkg $((waited / 60)) мин"
+done
+# Только недостающее: на машине с хабом всё уже стоит, apt не нужен вовсе.
+NEED=()
+for p in git python3 python3-venv curl ca-certificates; do
+    dpkg -s "$p" >/dev/null 2>&1 || NEED+=("$p")
+done
+# Шрифты: без них кириллица и эмодзи на скриншотах — квадраты. Не критично.
+FONTS=()
+for p in fonts-dejavu-core fonts-noto-color-emoji; do
+    dpkg -s "$p" >/dev/null 2>&1 || FONTS+=("$p")
+done
+if [ ${#NEED[@]} -gt 0 ] || [ ${#FONTS[@]} -gt 0 ]; then
+    log "Пакеты: ${NEED[*]} ${FONTS[*]} (apt-get update, до 5 минут)"
+    timeout 300 apt-get "${APT[@]}" update -qq 2>&1 | tail -3 || warn "apt-get update не прошёл — пробуем с тем, что есть"
+    if [ ${#NEED[@]} -gt 0 ]; then
+        timeout 900 apt-get "${APT[@]}" install -y --no-install-recommends "${NEED[@]}" 2>&1 \
+            | { grep -E --line-buffered '^(Get:|Setting up|E:)' || true; } \
+            || die "apt-get install не прошёл (или занят dpkg: ps aux | grep -E 'apt|dpkg')"
+        for p in "${NEED[@]}"; do dpkg -s "$p" >/dev/null 2>&1 || die "пакет $p не встал — вывод apt выше"; done
+    fi
+    if [ ${#FONTS[@]} -gt 0 ]; then
+        timeout 600 apt-get "${APT[@]}" install -y --no-install-recommends "${FONTS[@]}" 2>&1 \
+            | { grep -E --line-buffered '^(Get:|E:)' || true; } \
+            || warn "шрифты не встали — на скриншотах могут быть квадраты вместо эмодзи"
+    fi
+else
+    log "Пакеты уже стоят"
+fi
 
 # ── 2. Код ───────────────────────────────────────────────────────────────────
 mkdir -p "$BASE"
@@ -107,7 +137,8 @@ BROWSER_ON=0
 if [ "$WITH_BROWSER" = "1" ]; then
     log "Chromium и его библиотеки (Playwright, ~200 МБ; несколько минут)"
     if PLAYWRIGHT_BROWSERS_PATH="$BASE/pw-browsers" timeout 1500 "$BASE/venv/bin/python" -m playwright \
-            install --with-deps chromium 2>&1 | { grep -vE '^\s*\|' || true; } | tail -5; then
+            install --with-deps chromium 2>&1 \
+            | { grep -E --line-buffered -i '^(Downloading|Chromium|Installing|Get:|Setting up|E:|Error|Failed)' || true; }; then
         chmod -R a+rX "$BASE/pw-browsers" 2>/dev/null || true
         BROWSER_ON=1
     else
