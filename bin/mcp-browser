@@ -1,0 +1,117 @@
+#!/usr/bin/env bash
+# mcp-browser на сервере:
+#   mcp-browser                 — ссылка коннектора и состояние (то же: info)
+#   mcp-browser url             — только ссылка коннектора
+#   mcp-browser telegram        — подключить Telegram-канал (токен бота вводится без эха)
+#   mcp-browser vk              — подключить стену VK
+#   mcp-browser profile-import <имя> <cookies.json|cookies.txt> — вход в соцсеть из своего браузера
+#   mcp-browser profile-list | profile-delete <имя>
+#   mcp-browser proxy [адрес|off] — выход в интернет через прокси (например, ноду)
+#   mcp-browser audit [N] | logs | restart | rotate-secret | update
+set -uo pipefail
+ENVF="${MCP_BROWSER_ENV:-/etc/mcp-browser.env}"
+BASE="${MCP_BROWSER_BASE:-/opt/mcp-browser}"
+APP=$BASE/app
+PY=$BASE/venv/bin/python
+SVC_USER=mcp-browser
+
+die() { echo "✗ $*" >&2; exit 1; }
+[ "$(id -u)" = "0" ] || die "нужен root"
+[ -r "$ENVF" ] || die "нет $ENVF — mcp-browser не установлен"
+envget() { grep -E "^$1=" "$ENVF" 2>/dev/null | tail -1 | cut -d= -f2- || true; }
+envset() {
+    cp -a "$ENVF" "$ENVF.bak"
+    if grep -qE "^$1=" "$ENVF"; then
+        local tmp; tmp="$(mktemp)"
+        awk -v k="$1" -v v="$2" 'BEGIN{FS=OFS="="} $1==k{print k"="v; next} {print}' "$ENVF" > "$tmp" && cat "$tmp" > "$ENVF"
+        rm -f "$tmp"
+    else
+        printf '%s=%s\n' "$1" "$2" >> "$ENVF"
+    fi
+}
+# CLI — от пользователя сервиса: профили должны принадлежать ему, а не root.
+cli() {
+    ( cd "$APP" && runuser -u "$SVC_USER" -- env MCP_BROWSER_STATE_DIR="$(envget MCP_BROWSER_STATE_DIR)" \
+        "$PY" -m mcp_browser.cli "$@" )
+}
+ask_s() { local a; printf '› %s ' "$1" >&2; IFS= read -rs a </dev/tty || a=""; echo >&2; printf '%s' "$a"; }
+ask()   { local a; printf '› %s ' "$1" >&2; IFS= read -r a </dev/tty || a=""; printf '%s' "$a"; }
+
+base_url() {
+    local d p; d="$(envget MCP_BROWSER_PUBLIC_HOSTS)"; p="$(envget MCP_BROWSER_PUBLIC_PORT)"
+    if [ -z "$d" ]; then echo "https://<домен вашего прокси>"; return; fi
+    local u="https://$d"; [ -z "$p" ] || [ "$p" = "443" ] || u="$u:$p"
+    [ "$(envget MCP_BROWSER_BEHIND_HUB)" = "1" ] && u="$u/browser"
+    echo "$u"
+}
+restart() { systemctl restart mcp-browser && echo "✓ mcp-browser перезапущен" || echo "✗ перезапуск не прошёл: journalctl -u mcp-browser -n 30"; }
+
+info() {
+    local B; B="$(base_url)"
+    echo
+    echo "1) Коннектор для claude.ai — Settings → Connectors → Add custom connector:"
+    echo "     $B/mcp/$(envget MCP_BROWSER_SECRET)"
+    if systemctl is-active --quiet mcp-browser; then echo "   ✓ сервис работает"; else echo "   ✗ сервис не работает: journalctl -u mcp-browser -n 50"; fi
+    if curl -fsS --connect-timeout 5 -m 10 "$B/healthz" >/dev/null 2>&1; then
+        echo "   ✓ отвечает по https"
+    else
+        echo "   ✗ по https не отвечает — сертификат/Caddy: journalctl -u nexus-mcp-caddy -u mcp-browser-caddy -n 30"
+    fi
+    [ "$(envget MCP_BROWSER_BROWSER)" = "1" ] && echo "   браузер: Chromium есть" || echo "   браузер: нет (только поиск и чтение) — повторите установку"
+    [ -n "$(envget MCP_BROWSER_PROXY)" ] && echo "   выход в интернет через прокси: $(envget MCP_BROWSER_PROXY | sed -E 's#//[^@/]*@#//***@#')"
+    echo
+    echo "2) Соцсети через API:"
+    if [ -n "$(envget MCP_BROWSER_TG_BOT_TOKEN)" ]; then echo "   Telegram ✓ каналы: $(envget MCP_BROWSER_TG_CHATS)"; else echo "   Telegram — не подключён: mcp-browser telegram"; fi
+    if [ -n "$(envget MCP_BROWSER_VK_TOKEN)" ]; then echo "   VK ✓ стены: $(envget MCP_BROWSER_VK_OWNERS)"; else echo "   VK — не подключён: mcp-browser vk"; fi
+    echo
+    echo "3) Входы браузера (Instagram, X, Дзен, VK… — любые сайты):"
+    cli profile-list | sed 's/^/     /'
+    echo "   Добавить: экспорт cookies расширением Cookie-Editor → на сервер → mcp-browser profile-import <имя> файл"
+    echo "   или попросить Claude войти: browser_open(<страница входа>, profile=<имя>)"
+    echo
+    echo "Настройки: $ENVF → mcp-browser restart"
+}
+
+case "${1:-info}" in
+    info) info ;;
+    url) echo "$(base_url)/mcp/$(envget MCP_BROWSER_SECRET)" ;;
+    telegram)
+        echo "Бот: @BotFather → /newbot → токен. Добавьте бота админом канала с правом «Публикация сообщений»."
+        tok="$(ask_s "Токен бота:")"; [ -n "$tok" ] || die "пусто"
+        # Токен — через stdin, не в аргументах: их видно в ps.
+        me="$(printf 'url = "https://api.telegram.org/bot%s/getMe"\n' "$tok" | curl -fsS -m 15 -K - 2>/dev/null || true)"
+        echo "$me" | grep -q '"ok":true' || die "Telegram не принял токен (или api.telegram.org недоступен с сервера)"
+        echo "✓ бот @$(echo "$me" | sed -n 's/.*"username":"\([^"]*\)".*/\1/p')"
+        chats="$(ask "Каналы через запятую (@name или -100…):")"; [ -n "$chats" ] || die "пусто"
+        envset MCP_BROWSER_TG_BOT_TOKEN "$tok"; envset MCP_BROWSER_TG_CHATS "${chats// /}"; restart ;;
+    vk)
+        echo "Ключ пользователя VK с правами wall, photos, offline (например, через vkhost.github.io → «VK Admin»)."
+        tok="$(ask_s "Ключ:")"; [ -n "$tok" ] || die "пусто"
+        me="$(printf 'access_token=%s&v=5.199' "$tok" | curl -fsS -m 15 -d @- https://api.vk.com/method/users.get 2>/dev/null || true)"
+        echo "$me" | grep -q '"response"' || die "VK не принял ключ: $(echo "$me" | head -c 200)"
+        echo "✓ ключ рабочий: $(echo "$me" | sed -n 's/.*"first_name":"\([^"]*\)".*"last_name":"\([^"]*\)".*/\1 \2/p')"
+        owners="$(ask "Стены через запятую (-id сообщества, id страницы):")"; [ -n "$owners" ] || die "пусто"
+        envset MCP_BROWSER_VK_TOKEN "$tok"; envset MCP_BROWSER_VK_OWNERS "${owners// /}"; restart ;;
+    profile-import)
+        [ $# -eq 3 ] || die "mcp-browser profile-import <имя> <файл cookies>"
+        [ -r "$3" ] || die "нет файла $3"
+        cli profile-import "$2" - < "$3" && echo "  файл с cookies — это вход в аккаунт; удалите его: rm '$3'" ;;
+    profile-list) cli profile-list ;;
+    profile-delete) [ $# -eq 2 ] || die "mcp-browser profile-delete <имя>"; cli profile-delete "$2" ;;
+    proxy)
+        case "${2:-}" in
+            "") echo "Сейчас: $(envget MCP_BROWSER_PROXY | sed -E 's#//[^@/]*@#//***@#' | sed 's/^$/напрямую/')" ;;
+            off) envset MCP_BROWSER_PROXY ""; restart ;;
+            http://*|https://*|socks5://*) envset MCP_BROWSER_PROXY "$2"; restart ;;
+            *) die "адрес прокси: http://host:port или socks5://user:pass@host:port; off — напрямую" ;;
+        esac ;;
+    audit) cli audit "${2:-30}" ;;
+    logs) journalctl -u mcp-browser -n "${2:-80}" --no-pager ;;
+    restart) restart ;;
+    rotate-secret)
+        envset MCP_BROWSER_SECRET "$(head -c 64 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 40)"; restart
+        echo "Старая ссылка больше не работает. Новая — поправьте её в коннекторе claude.ai:"; "$0" url ;;
+    update) bash <(curl -fsSL --connect-timeout 15 -m 120 https://raw.githubusercontent.com/Rklm-it/mcp-browser-cl/main/install.sh) ;;
+    -h|--help|help) sed -n 2,11p "$0" ;;
+    *) sed -n 2,11p "$0"; exit 2 ;;
+esac
