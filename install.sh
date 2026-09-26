@@ -62,12 +62,33 @@ export DEBIAN_FRONTEND=noninteractive
 # процессов, и apt, тронув терминал, получает SIGTTOU и замирает (статус T в
 # ps) — установка «висела» на пакетах, уже поставив их.
 APT=(-o DPkg::Lock::Timeout=600 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30)
-# dpkg занят (на свежем VPS — unattended-upgrades): говорим, кого ждём, а
-# не молчим — иначе ожидание неотличимо от зависания.
-dpkg_busy() { pgrep -a -x 'apt|apt-get|dpkg|unattended-upgr' 2>/dev/null | grep -v "^$$ " | head -1; }
+# dpkg занят (на свежем VPS — автообновления): говорим, кого ждём, а не
+# молчим — иначе ожидание неотличимо от зависания. Проверяем сам замок dpkg,
+# а не имена процессов: unattended-upgrade-shutdown висит в Ubuntu всегда и
+# dpkg не держит — по имени он давал ложное «занято».
+dpkg_locked() {
+    command -v python3 >/dev/null 2>&1 || return 1
+    python3 - <<'PY' 2>/dev/null
+import fcntl, sys
+for p in ("/var/lib/dpkg/lock-frontend", "/var/lib/dpkg/lock"):
+    try:
+        f = open(p, "a")
+    except OSError:
+        continue
+    try:
+        fcntl.lockf(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        sys.exit(0)  # замок держит другой процесс
+sys.exit(1)
+PY
+}
+dpkg_holder() {
+    pgrep -af '(^|/)(apt|apt-get|dpkg|unattended-upgrade)( |$)' 2>/dev/null | grep -v -- '--wait-for-signal' \
+        | head -1 | cut -d' ' -f2- | cut -c1-120
+}
 waited=0
-while b="$(dpkg_busy)" && [ -n "$b" ] && [ "$waited" -lt 900 ]; do
-    [ "$waited" = "0" ] && warn "dpkg занят: ${b#* } — жду (обычно это автообновления, до 15 минут; ускорить: systemctl stop unattended-upgrades)"
+while dpkg_locked && [ "$waited" -lt 900 ]; do
+    [ "$waited" = "0" ] && warn "dpkg занят: $(dpkg_holder || echo 'другой процесс') — жду (обычно автообновления; ускорить: systemctl stop unattended-upgrades)"
     sleep 10; waited=$((waited + 10))
     [ $((waited % 60)) = 0 ] && echo "    …жду dpkg $((waited / 60)) мин"
 done
