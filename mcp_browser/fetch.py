@@ -10,6 +10,7 @@ import io
 import json
 import time
 from dataclasses import dataclass
+from typing import BinaryIO
 
 import httpx
 
@@ -18,6 +19,7 @@ from mcp_browser.guard import check_url
 
 MAX_BYTES = 15 * 1024 * 1024
 MAX_IMAGE = 4 * 1024 * 1024
+UPLOAD_BYTES = 300 * 1024 * 1024  # файл для загрузки на сайт: видео бывает больше страницы
 FORMATS = ("markdown", "text", "html", "links")
 IMAGE_TYPES = {"image/png": "png", "image/jpeg": "jpeg", "image/jpg": "jpeg",
                "image/gif": "gif", "image/webp": "webp"}
@@ -52,8 +54,9 @@ def client(**kw) -> httpx.AsyncClient:
                              proxy=s.proxy or None, follow_redirects=False, **kw)
 
 
-async def download(url: str, max_bytes: int = MAX_BYTES) -> Page:
-    """GET с ручными редиректами: каждый переход проверяется guard'ом."""
+async def download(url: str, max_bytes: int = MAX_BYTES, sink: BinaryIO | None = None) -> Page:
+    """GET с ручными редиректами: каждый переход проверяется guard'ом. С `sink` тело пишется туда,
+    а не в память (большие файлы для загрузки), и в Page.body остаётся пусто."""
     url = await check_url(url)
     async with client() as c:
         for _ in range(10):
@@ -68,10 +71,15 @@ async def download(url: str, max_bytes: int = MAX_BYTES) -> Page:
                         raise FetchError(f"файл {declared // 1024 // 1024} МБ — больше предела "
                                          f"{max_bytes // 1024 // 1024} МБ")
                     buf = bytearray()
+                    size = 0
                     async for chunk in r.aiter_bytes():
-                        buf += chunk
-                        if len(buf) > max_bytes:
+                        size += len(chunk)
+                        if size > max_bytes:
                             raise FetchError(f"ответ больше {max_bytes // 1024 // 1024} МБ — оборван")
+                        if sink is None:
+                            buf += chunk
+                        else:
+                            sink.write(chunk)
                     page = Page(str(r.url), r.status_code, ctype, bytes(buf))
                     if page.is_html or ctype.startswith("text/") or "json" in ctype or "xml" in ctype:
                         page.text = _decode(buf, r.charset_encoding)

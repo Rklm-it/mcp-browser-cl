@@ -61,6 +61,30 @@ def test_open_type_click_upload_screenshot(fresh, site, settings):
     assert any(c["name"] == "seen" for c in st["cookies"]), "вход профиля не сохранился"
 
 
+def test_upload_keeps_the_file_until_the_site_reads_it(fresh, site, settings):
+    from conftest import BIG
+
+    settings.allow_private = True
+
+    async def flow():
+        try:
+            snap = await server.browser_open(site + "/lazy")
+            sid = snap.split("Сессия: ")[1].split()[0]
+            ref = next(ln for ln in snap.splitlines() if "input[file]" in ln).split("]")[0][1:]
+            out = await server.browser_act(sid, "upload", ref=int(ref), files=[site + "/big.mp4"])
+            assert "✓ upload 1" in out, out
+            out = await server.browser_act(sid, "wait", text="прочитано")
+            assert f"прочитано: {BIG}" in out, out  # и большой, и прочитан позже
+            dirs = list(fresh.sessions[sid].uploads)
+            assert dirs and all(d.exists() for d in dirs)
+            await server.browser_close(sid)
+            assert not any(d.exists() for d in dirs)  # закрыл сессию — файлы убраны
+        finally:
+            await fresh.shutdown()
+
+    asyncio.run(flow())
+
+
 def test_guard_in_browser(fresh, site):
     async def flow():
         try:

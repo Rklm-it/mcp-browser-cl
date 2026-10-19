@@ -23,6 +23,14 @@ FORM = """<html><head><title>Форма</title></head><body>
 <a href="/article">Статья</a>
 </body></html>"""
 
+# Сайт читает выбранный файл не сразу, а через секунду — как Instagram видео при обработке
+LAZY = """<html><head><title>Ленивая</title></head><body><div id="out"></div>
+<input type="file" id="f" onchange="const f = this.files[0]; setTimeout(async () => {
+ try { const b = await f.arrayBuffer(); document.getElementById('out').innerText = 'прочитано: ' + b.byteLength }
+ catch (e) { document.getElementById('out').innerText = 'не прочитан: ' + e.name } }, 1000)">
+</body></html>"""
+BIG = 20 * 1024 * 1024  # больше предела страницы (15 МБ), меньше предела загрузки
+
 SPA = """<html><head><title>SPA</title></head><body><div id="root"></div><noscript>Включите JavaScript</noscript>
 <script>document.getElementById('root').innerText = 'Содержимое, собранное скриптом. '.repeat(30)</script></body></html>"""
 
@@ -51,6 +59,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, ARTICLE)
         if p == "/form":
             return self._send(200, FORM)
+        if p == "/lazy":
+            return self._send(200, LAZY)
+        if p == "/big.mp4":
+            return self._send(200, bytes(BIG), "video/mp4")
         if p == "/spa":
             return self._send(200, SPA)
         if p == "/img.png":
