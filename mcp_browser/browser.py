@@ -90,6 +90,7 @@ class Session:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     notes: list[str] = field(default_factory=list)
     blocked: list[str] = field(default_factory=list)
+    uploads: list[Path] = field(default_factory=list)  # каталоги файлов, отданных сайту: живут до закрытия
 
     @property
     def page(self):
@@ -304,6 +305,8 @@ class Manager:
             await sess.context.close()
         except Exception:
             pass
+        for d in sess.uploads:
+            shutil.rmtree(d, ignore_errors=True)
         return True
 
     async def _save(self, sess: Session) -> None:
@@ -414,6 +417,7 @@ class Manager:
                     await asyncio.sleep(min(max(amount, 1), 30))
             elif action == "upload":
                 paths = await self._download_files(files or ([url] if url else []))
+                dirs = [Path(p).parent for p in paths]
                 try:
                     is_file = loc is not None and await loc.evaluate(
                         "e => e.tagName === 'INPUT' && e.type === 'file'")
@@ -425,9 +429,13 @@ class Manager:
                         async with page.expect_file_chooser(timeout=10000) as fc:
                             await loc.click(timeout=10000)
                         await (await fc.value).set_files(paths)
-                finally:
-                    for p in paths:
-                        shutil.rmtree(Path(p).parent, ignore_errors=True)
+                except BaseException:
+                    for d in dirs:
+                        shutil.rmtree(d, ignore_errors=True)
+                    raise
+                # Сайт читает файл, когда ему нужно (видео — при обработке, через секунды): стёртый
+                # сразу файл даёт «браузер не смог считать файл». Убираются при закрытии сессии.
+                sess.uploads += dirs
                 done = f"upload {len(paths)} файл(ов)"
             elif action == "tab":
                 n = amount or int(text or 0)
@@ -458,19 +466,24 @@ class Manager:
             raise BrowserError("upload: нужны адреса файлов (files=[url, …])")
         paths = []
         for u in urls[:10]:
+            tmp = Path(tempfile.mkdtemp(prefix="mcpb-"))
+            part = tmp / "download.part"
             try:
-                pg = await fetch.download(u)
+                fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "wb") as f:
+                    pg = await fetch.download(u, fetch.UPLOAD_BYTES, sink=f)
             except (fetch.FetchError, Blocked) as e:
+                shutil.rmtree(tmp, ignore_errors=True)
+                for p in paths:
+                    shutil.rmtree(Path(p).parent, ignore_errors=True)
                 raise BrowserError(f"файл {u[:120]} не скачался: {e}") from None
             name = Path(urlsplit(pg.url).path).name or "file"
             suffix = Path(name).suffix or {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp",
                                            "image/gif": ".gif", "video/mp4": ".mp4"}.get(pg.ctype, "")
             # Своё имя файла, а не временное: сайт его показывает и хранит.
             stem = re.sub(r"[^\w.-]", "_", Path(name).stem)[:60] or "file"
-            path = Path(tempfile.mkdtemp(prefix="mcpb-")) / f"{stem}{suffix}"
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-            with os.fdopen(fd, "wb") as f:
-                f.write(pg.body)
+            path = tmp / f"{stem}{suffix}"
+            part.rename(path)
             paths.append(str(path))
         return paths
 
